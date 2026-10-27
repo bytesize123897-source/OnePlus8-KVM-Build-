@@ -1,0 +1,194 @@
+name: Package OnePlus 8 KVM boot.img
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/package-boot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    env:
+      SOURCE_RUN_ID: '40475096930'
+      SOURCE_ARTIFACT_ID: '12723510313'
+      KVM_IMAGE_SHA256: 'd7ffc23bd93f9dd981dfa359f915a04a551de925db6c3cd83e490f3416caded5'
+      KERNEL_RELEASE: '4.19.157-perf+'
+
+      # This reference package was produced from the matching IN2010 stock boot
+      # by unpacking the stock boot, replacing only its kernel, then repacking.
+      # We use it only as a carrier for the stock boot layout/non-kernel payloads.
+      REFERENCE_URL: 'https://github.com/daxiaamu/ReSukiSU-OnePlus-Legacy/releases/download/v0.3.0/oneplus-8-coloros-IN2010_13.1.0.190-CN01-v0.3.0.zip'
+      REFERENCE_ZIP_SHA256: '76ff74b28a1eb5954d2c275a772642bd7e37891b765a6ade1d595e34f04be947'
+      REFERENCE_BOOT_SHA256: 'ce16155f0f1dfaa90da4c2508c8d219a8fdeeec35101669ea50d3979001a04d4'
+      STOCK_BOOT_SIZE: '100663296'
+
+      MAGISK_URL: 'https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk'
+      MAGISK_APK_SHA256: 'e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5'
+      MAGISKBOOT_MEMBER: 'lib/x86_64/libmagiskboot.so'
+
+      OUTPUT_NAME: 'boot-IN2010-13.1.0.190-KVM.img'
+
+    steps:
+      - name: Checkout packaging controls
+        uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl unzip file coreutils diffutils
+
+      - name: Download verified KVM Image from successful run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          mkdir -p package/kernel package/reference package/out package/verify
+
+          curl -fL --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$SOURCE_ARTIFACT_ID/zip" \
+            -o package/kernel-artifact.zip
+
+          unzip -q package/kernel-artifact.zip -d package/kernel
+          test -s package/kernel/Image
+          echo "$KVM_IMAGE_SHA256  package/kernel/Image" | sha256sum -c -
+          grep -qx "$KERNEL_RELEASE" package/kernel/kernelrelease.txt
+
+      - name: Download and verify matching IN2010 boot carrier
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          curl -fL --retry 3 "$REFERENCE_URL" -o package/reference.zip
+          echo "$REFERENCE_ZIP_SHA256  package/reference.zip" | sha256sum -c -
+          unzip -q package/reference.zip -d package/reference
+
+          mapfile -t boots < <(find package/reference -type f -name 'boot*.img' -print | sort)
+          printf 'boot candidates:\n%s\n' "${boots[*]}"
+          test "${#boots[@]}" -eq 1
+          cp "${boots[0]}" package/reference-boot.img
+          echo "$REFERENCE_BOOT_SHA256  package/reference-boot.img" | sha256sum -c -
+          test "$(stat -c %s package/reference-boot.img)" -eq "$STOCK_BOOT_SIZE"
+
+      - name: Download pinned magiskboot
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          curl -fL --retry 3 "$MAGISK_URL" -o package/Magisk.apk
+          echo "$MAGISK_APK_SHA256  package/Magisk.apk" | sha256sum -c -
+          unzip -p package/Magisk.apk "$MAGISKBOOT_MEMBER" > package/magiskboot
+          chmod +x package/magiskboot
+          test -x package/magiskboot
+          file package/magiskboot
+
+      - name: Repack boot with only the verified KVM kernel replaced
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p package/work/base package/work/check
+          cp package/reference-boot.img package/work/base/base.img
+          cp package/magiskboot package/work/base/magiskboot
+
+          pushd package/work/base
+          ./magiskboot unpack base.img 2>&1 | tee ../../base-unpack.log
+          test -s kernel
+
+          # Snapshot every unpacked non-kernel payload before replacing anything.
+          find . -maxdepth 1 -type f -printf '%f\n' \
+            | grep -vE '^(base\.img|magiskboot|kernel)$' \
+            | sort > ../../base-nonkernel-files.txt
+          : > ../../base-nonkernel.sha256
+          while IFS= read -r f; do
+            sha256sum "$f" >> ../../base-nonkernel.sha256
+          done < ../../base-nonkernel-files.txt
+
+          cp ../../../kernel/Image kernel
+          echo "$KVM_IMAGE_SHA256  kernel" | sha256sum -c -
+
+          ./magiskboot repack base.img candidate.img 2>&1 | tee ../../repack.log
+          test -s candidate.img
+          popd
+
+          candidate_size="$(stat -c %s package/work/base/candidate.img)"
+          test "$candidate_size" -le "$STOCK_BOOT_SIZE"
+          cp package/work/base/candidate.img "package/out/$OUTPUT_NAME"
+          truncate -s "$STOCK_BOOT_SIZE" "package/out/$OUTPUT_NAME"
+          test "$(stat -c %s "package/out/$OUTPUT_NAME")" -eq "$STOCK_BOOT_SIZE"
+
+      - name: Verify final boot payloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp "package/out/$OUTPUT_NAME" package/work/check/final.img
+          cp package/magiskboot package/work/check/magiskboot
+
+          pushd package/work/check
+          ./magiskboot unpack final.img 2>&1 | tee ../../final-unpack.log
+          test -s kernel
+          echo "$KVM_IMAGE_SHA256  kernel" | sha256sum -c -
+
+          find . -maxdepth 1 -type f -printf '%f\n' \
+            | grep -vE '^(final\.img|magiskboot|kernel)$' \
+            | sort > ../../final-nonkernel-files.txt
+          popd
+
+          diff -u package/base-nonkernel-files.txt package/final-nonkernel-files.txt
+
+          pushd package/work/check
+          sha256sum -c ../../base-nonkernel.sha256
+          popd
+
+          sha256sum "package/out/$OUTPUT_NAME" | tee package/out/SHA256SUMS.txt
+
+          {
+            echo "OnePlus 8 IN2010 KVM boot packaging report"
+            echo "========================================="
+            echo "Source successful run: $SOURCE_RUN_ID"
+            echo "Source artifact id: $SOURCE_ARTIFACT_ID"
+            echo "Kernel release: $KERNEL_RELEASE"
+            echo "KVM Image SHA256: $KVM_IMAGE_SHA256"
+            echo "Reference package SHA256: $REFERENCE_ZIP_SHA256"
+            echo "Reference carrier boot SHA256: $REFERENCE_BOOT_SHA256"
+            echo "Expected final boot size: $STOCK_BOOT_SIZE"
+            echo "Actual final boot size: $(stat -c %s "package/out/$OUTPUT_NAME")"
+            echo
+            echo "Verification:"
+            echo "- final unpacked kernel hash matches successful KVM Image"
+            echo "- non-kernel unpacked file list matches reference carrier"
+            echo "- every non-kernel unpacked payload SHA256 matches reference carrier"
+            echo "- final image padded to the original boot partition image size"
+            echo
+            echo "Status: packaged and structurally verified; on-device boot verification still required."
+          } | tee package/out/PACKAGING_REPORT.txt
+
+      - name: Upload packaged boot image
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus8-IN2010-13.1.0.190-KVM-boot
+          path: |
+            package/out/boot-IN2010-13.1.0.190-KVM.img
+            package/out/SHA256SUMS.txt
+            package/out/PACKAGING_REPORT.txt
+            package/base-unpack.log
+            package/repack.log
+            package/final-unpack.log
+          if-no-files-found: error
+          retention-days: 30
