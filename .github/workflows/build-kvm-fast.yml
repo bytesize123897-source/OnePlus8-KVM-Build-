@@ -1,0 +1,195 @@
+name: Fast rebuild OnePlus 8 KVM kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-kvm-fast:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    env:
+      OFFICIAL_KERNEL_SHA: 1d2678a3548f4825447f17b25a5cc1754c4cd1ae
+      OFFICIAL_MODULES_SHA: 01fb3921e0f57c338c95f9bcbe1a9938821c7e6d
+      VERIFIED_STOCK_CONFIG_SHA256: ccb61daefc1d8e0f6de80eb4c4270173cabb1f1f9187e2749411e280d9ea7d6e
+      KERNEL_DIR: kernel/msm-4.19
+      MODULES_DIR: official-modules
+      OUT_DIR: out
+      ARTIFACT_DIR: artifact
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: 'true'
+      CCACHE_MAXSIZE: 5G
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Checkout build controls
+        uses: actions/checkout@v4
+        with:
+          path: control
+
+      - name: Checkout pinned official sources
+        uses: actions/checkout@v4
+        with:
+          repository: OnePlusOSS/android_kernel_oneplus_sm8250
+          ref: ${{ env.OFFICIAL_KERNEL_SHA }}
+          path: ${{ env.KERNEL_DIR }}
+          fetch-depth: 1
+
+      - name: Checkout pinned modules and device tree
+        uses: actions/checkout@v4
+        with:
+          repository: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8250
+          ref: ${{ env.OFFICIAL_MODULES_SHA }}
+          path: ${{ env.MODULES_DIR }}
+          fetch-depth: 1
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            ccache rsync python3 git make clang-14 llvm-14 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
+          ccache --set-config=compression=true
+          ccache --set-config=compiler_check=content
+          ccache --zero-stats
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: oneplus8-fast-kvm-clang14-gnu-ld-${{ hashFiles('control/configs/kvm-minimal.config', 'control/patches/sm8250-link-compat.patch') }}
+          restore-keys: |
+            oneplus8-fast-kvm-clang14-gnu-ld-
+            oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-gnu-ld-
+
+      - name: Assemble verified source baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git -C "$KERNEL_DIR" rev-parse HEAD)" = "$OFFICIAL_KERNEL_SHA"
+          test "$(git -C "$MODULES_DIR" rev-parse HEAD)" = "$OFFICIAL_MODULES_SHA"
+
+          rsync -a "$MODULES_DIR/kernel/msm-4.19/" "$KERNEL_DIR/"
+          rm -rf vendor
+          ln -s "$GITHUB_WORKSPACE/$MODULES_DIR/vendor" vendor
+
+          git -C "$KERNEL_DIR" apply --check "$GITHUB_WORKSPACE/control/patches/sm8250-link-compat.patch"
+          git -C "$KERNEL_DIR" apply "$GITHUB_WORKSPACE/control/patches/sm8250-link-compat.patch"
+
+      - name: Configure from verified stock baseline plus KVM
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$OUT_DIR" "$ARTIFACT_DIR"
+
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
+
+          cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$OUT_DIR/OplusKernelEnvConfig.mk"
+          cp "$KERNEL_DIR/oplus_native_features.mk" "$OUT_DIR/oplus_native_features.mk"
+
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR"
+            O="$GITHUB_WORKSPACE/$OUT_DIR"
+            ARCH=arm64
+            SUBARCH=arm64
+            CC="ccache clang-14"
+            HOSTCC="ccache clang-14"
+            HOSTCXX="ccache clang++-14"
+            LD=aarch64-linux-gnu-ld
+            AR=llvm-ar-14
+            NM=llvm-nm-14
+            OBJCOPY=aarch64-linux-gnu-objcopy
+            OBJDUMP=llvm-objdump-14
+            STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            BRAND_SHOW_FLAG=oneplus
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+          )
+
+          # Configuration generation is cheap. Verify it exactly matches the
+          # stock config that produced Image-stock in successful run 40475096930.
+          make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
+          echo "$VERIFIED_STOCK_CONFIG_SHA256  $OUT_DIR/.config" | sha256sum -c -
+          cp "$OUT_DIR/.config" "$OUT_DIR/stock.config"
+
+          "$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" \
+            -e VIRTUALIZATION \
+            -e KVM
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          grep -qx 'CONFIG_VIRTUALIZATION=y' "$OUT_DIR/.config"
+          grep -qx 'CONFIG_KVM=y' "$OUT_DIR/.config"
+          "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" \
+            | tee "$ARTIFACT_DIR/config-diff.txt"
+          make -s "${MAKE_ARGS[@]}" kernelrelease | tee "$ARTIFACT_DIR/kernelrelease.txt"
+          cp "$OUT_DIR/.config" "$ARTIFACT_DIR/final-kvm.config"
+
+      - name: Build KVM Image only
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
+
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR"
+            O="$GITHUB_WORKSPACE/$OUT_DIR"
+            ARCH=arm64
+            SUBARCH=arm64
+            CC="ccache clang-14"
+            HOSTCC="ccache clang-14"
+            HOSTCXX="ccache clang++-14"
+            LD=aarch64-linux-gnu-ld
+            AR=llvm-ar-14
+            NM=llvm-nm-14
+            OBJCOPY=aarch64-linux-gnu-objcopy
+            OBJDUMP=llvm-objdump-14
+            STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            BRAND_SHOW_FLAG=oneplus
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+          )
+
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image 2>&1 | tee "$ARTIFACT_DIR/build-kvm-fast.log"
+          test -s "$OUT_DIR/arch/arm64/boot/Image"
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
+          [ ! -f "$OUT_DIR/System.map" ] || cp "$OUT_DIR/System.map" "$ARTIFACT_DIR/System.map"
+          [ ! -f "$OUT_DIR/Module.symvers" ] || cp "$OUT_DIR/Module.symvers" "$ARTIFACT_DIR/Module.symvers"
+          sha256sum "$ARTIFACT_DIR/Image" | tee "$ARTIFACT_DIR/SHA256SUMS.txt"
+          ccache --show-stats || true
+
+      - name: Upload fast-build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus8-IN2010-KVM-fast
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
