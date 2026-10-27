@@ -1,0 +1,221 @@
+name: Build OnePlus 8 KVM diagnostic with SVE restored
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-kvm-diag-sve.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      OFFICIAL_KERNEL_SHA: 1d2678a3548f4825447f17b25a5cc1754c4cd1ae
+      OFFICIAL_MODULES_SHA: 01fb3921e0f57c338c95f9bcbe1a9938821c7e6d
+      VERIFIED_STOCK_CONFIG_SHA256: ccb61daefc1d8e0f6de80eb4c4270173cabb1f1f9187e2749411e280d9ea7d6e
+      KERNEL_DIR: kernel/msm-4.19
+      MODULES_DIR: official-modules
+      OUT_DIR: out
+      ARTIFACT_DIR: artifact
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 5G
+      REFERENCE_URL: https://github.com/daxiaamu/ReSukiSU-OnePlus-Legacy/releases/download/v0.3.0/oneplus-8-coloros-IN2010_13.1.0.190-CN01-v0.3.0.zip
+      REFERENCE_ZIP_SHA256: 76ff74b28a1eb5954d2c275a772642bd7e37891b765a6ade1d595e34f04be947
+      REFERENCE_BOOT_SHA256: ce16155f0f1dfaa90da4c2508c8d219a8fdeeec35101669ea50d3979001a04d4
+      STOCK_BOOT_SIZE: '100663296'
+      MAGISK_URL: https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk
+      MAGISK_APK_SHA256: e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5
+      MAGISKBOOT_MEMBER: lib/x86_64/libmagiskboot.so
+      OUTPUT_NAME: boot-IN2010-13.1.0.190-KVM-DIAG-BYPASS-HYP-SVE.img
+
+    steps:
+      - name: Checkout controls
+        uses: actions/checkout@v4
+        with:
+          path: control
+
+      - name: Checkout pinned official kernel
+        uses: actions/checkout@v4
+        with:
+          repository: OnePlusOSS/android_kernel_oneplus_sm8250
+          ref: ${{ env.OFFICIAL_KERNEL_SHA }}
+          path: ${{ env.KERNEL_DIR }}
+          fetch-depth: 1
+
+      - name: Checkout pinned modules and device tree
+        uses: actions/checkout@v4
+        with:
+          repository: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8250
+          ref: ${{ env.OFFICIAL_MODULES_SHA }}
+          path: ${{ env.MODULES_DIR }}
+          fetch-depth: 1
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev ccache rsync python3 git make \
+            clang-14 llvm-14 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi curl unzip coreutils diffutils
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
+          ccache --set-config=compression=true
+          ccache --set-config=compiler_check=content
+          ccache --zero-stats
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: oneplus8-kvm-diag-sve-${{ hashFiles('control/patches/sm8250-link-compat.patch', 'control/patches/kvm-diag-bypass-arch-init.patch') }}
+          restore-keys: |
+            oneplus8-kvm-diag-bypass-
+            oneplus8-fast-kvm-clang14-gnu-ld-
+            oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-gnu-ld-
+
+      - name: Assemble source and apply diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git -C "$KERNEL_DIR" rev-parse HEAD)" = "$OFFICIAL_KERNEL_SHA"
+          test "$(git -C "$MODULES_DIR" rev-parse HEAD)" = "$OFFICIAL_MODULES_SHA"
+          rsync -a "$MODULES_DIR/kernel/msm-4.19/" "$KERNEL_DIR/"
+          rm -rf vendor
+          ln -s "$GITHUB_WORKSPACE/$MODULES_DIR/vendor" vendor
+          git -C "$KERNEL_DIR" apply --check "$GITHUB_WORKSPACE/control/patches/sm8250-link-compat.patch"
+          git -C "$KERNEL_DIR" apply "$GITHUB_WORKSPACE/control/patches/sm8250-link-compat.patch"
+          git -C "$KERNEL_DIR" apply --check "$GITHUB_WORKSPACE/control/patches/kvm-diag-bypass-arch-init.patch"
+          git -C "$KERNEL_DIR" apply "$GITHUB_WORKSPACE/control/patches/kvm-diag-bypass-arch-init.patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('kernel/msm-4.19/arch/arm64/Kconfig')
+          s = p.read_text()
+          old = '\tdepends on !KVM || ARM64_VHE\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one ARM64_SVE dependency line, found {s.count(old)}')
+          p.write_text(s.replace(old, '\tdepends on y\n', 1))
+          PY
+          grep -n -A5 -B2 '^config ARM64_SVE' "$KERNEL_DIR/arch/arm64/Kconfig"
+          grep -n -A8 -B3 'KVM-DIAG: bypassing' "$KERNEL_DIR/virt/kvm/arm/arm.c"
+
+      - name: Configure KVM plus restored SVE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$OUT_DIR" "$ARTIFACT_DIR"
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
+          cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$OUT_DIR/OplusKernelEnvConfig.mk"
+          cp "$KERNEL_DIR/oplus_native_features.mk" "$OUT_DIR/oplus_native_features.mk"
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR" O="$GITHUB_WORKSPACE/$OUT_DIR" ARCH=arm64 SUBARCH=arm64
+            CC="ccache clang-14" HOSTCC="ccache clang-14" HOSTCXX="ccache clang++-14"
+            LD=aarch64-linux-gnu-ld AR=llvm-ar-14 NM=llvm-nm-14
+            OBJCOPY=aarch64-linux-gnu-objcopy OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- BRAND_SHOW_FLAG=oneplus
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+          )
+          make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
+          echo "$VERIFIED_STOCK_CONFIG_SHA256  $OUT_DIR/.config" | sha256sum -c -
+          cp "$OUT_DIR/.config" "$OUT_DIR/stock.config"
+          "$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" -e VIRTUALIZATION -e KVM -e ARM64_SVE
+          make "${MAKE_ARGS[@]}" olddefconfig
+          grep -qx 'CONFIG_VIRTUALIZATION=y' "$OUT_DIR/.config"
+          grep -qx 'CONFIG_KVM=y' "$OUT_DIR/.config"
+          grep -qx 'CONFIG_ARM64_SVE=y' "$OUT_DIR/.config"
+          "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" | tee "$ARTIFACT_DIR/config-diff.txt"
+          cp "$OUT_DIR/.config" "$ARTIFACT_DIR/final.config"
+
+      - name: Build diagnostic Image
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR" O="$GITHUB_WORKSPACE/$OUT_DIR" ARCH=arm64 SUBARCH=arm64
+            CC="ccache clang-14" HOSTCC="ccache clang-14" HOSTCXX="ccache clang++-14"
+            LD=aarch64-linux-gnu-ld AR=llvm-ar-14 NM=llvm-nm-14
+            OBJCOPY=aarch64-linux-gnu-objcopy OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- BRAND_SHOW_FLAG=oneplus
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+          )
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image 2>&1 | tee "$ARTIFACT_DIR/build.log"
+          test -s "$OUT_DIR/arch/arm64/boot/Image"
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
+          [ ! -f "$OUT_DIR/Module.symvers" ] || cp "$OUT_DIR/Module.symvers" "$ARTIFACT_DIR/Module.symvers"
+          sha256sum "$ARTIFACT_DIR/Image" | tee "$ARTIFACT_DIR/IMAGE_SHA256.txt"
+          ccache --show-stats || true
+
+      - name: Package and verify boot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p package/reference package/work package/check "$ARTIFACT_DIR/boot"
+          curl -fL --retry 3 "$REFERENCE_URL" -o package/reference.zip
+          echo "$REFERENCE_ZIP_SHA256  package/reference.zip" | sha256sum -c -
+          unzip -q package/reference.zip -d package/reference
+          mapfile -t boots < <(find package/reference -type f -name 'boot*.img' -print | sort)
+          test "${#boots[@]}" -eq 1
+          cp "${boots[0]}" package/reference-boot.img
+          echo "$REFERENCE_BOOT_SHA256  package/reference-boot.img" | sha256sum -c -
+          test "$(stat -c %s package/reference-boot.img)" -eq "$STOCK_BOOT_SIZE"
+          curl -fL --retry 3 "$MAGISK_URL" -o package/Magisk.apk
+          echo "$MAGISK_APK_SHA256  package/Magisk.apk" | sha256sum -c -
+          unzip -p package/Magisk.apk "$MAGISKBOOT_MEMBER" > package/magiskboot
+          chmod +x package/magiskboot
+          cp package/reference-boot.img package/work/base.img
+          cp package/magiskboot package/work/magiskboot
+          pushd package/work
+          ./magiskboot unpack base.img
+          test -s kernel
+          cp ../../artifact/Image kernel
+          ./magiskboot repack base.img candidate.img
+          popd
+          cp package/work/candidate.img "$ARTIFACT_DIR/boot/$OUTPUT_NAME"
+          truncate -s "$STOCK_BOOT_SIZE" "$ARTIFACT_DIR/boot/$OUTPUT_NAME"
+          cp "$ARTIFACT_DIR/boot/$OUTPUT_NAME" package/check/final.img
+          cp package/magiskboot package/check/magiskboot
+          pushd package/check
+          ./magiskboot unpack final.img
+          cmp -s kernel ../../artifact/Image
+          popd
+          sha256sum "$ARTIFACT_DIR/boot/$OUTPUT_NAME" | tee "$ARTIFACT_DIR/boot/SHA256SUMS.txt"
+          printf '%s\n' \
+            'Diagnostic: CONFIG_KVM=y, ARM64_SVE forcibly restored to y, kvm_arch_init returns -ENODEV before HYP/EL2.' \
+            'Purpose: isolate whether KVM-induced ARM64_SVE disablement causes boot-animation hang.' \
+            > "$ARTIFACT_DIR/boot/README.txt"
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus8-IN2010-KVM-DIAG-BYPASS-HYP-SVE
+          path: |
+            artifact/boot/
+            artifact/config-diff.txt
+            artifact/final.config
+            artifact/IMAGE_SHA256.txt
+            artifact/Module.symvers
+          if-no-files-found: error
+          retention-days: 14
