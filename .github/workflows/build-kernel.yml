@@ -180,7 +180,15 @@ jobs:
             BRAND_SHOW_FLAG=oneplus
           )
 
-          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image
+          extract_errors() {
+            if [ -f "$ARTIFACT_DIR/build-kernel.log" ]; then
+              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld\.lld: error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
+                "$ARTIFACT_DIR/build-kernel.log" | head -n 120 > "$ARTIFACT_DIR/first-errors.txt" || true
+            fi
+          }
+          trap 'status=$?; extract_errors; exit $status' EXIT
+
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image 2>&1 | tee "$ARTIFACT_DIR/build-kernel.log"
           test -s "$OUT_DIR/arch/arm64/boot/Image"
           cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
 
@@ -191,10 +199,11 @@ jobs:
           sha256sum "$ARTIFACT_DIR/Image" | tee "$ARTIFACT_DIR/SHA256SUMS.txt"
           ccache --show-stats || true
 
-      - name: Upload kernel artifact
+      - name: Upload kernel artifact and diagnostics
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: oneplus8-IN2010-13.1.0.190-official-kvm-minimal
           path: artifact/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
