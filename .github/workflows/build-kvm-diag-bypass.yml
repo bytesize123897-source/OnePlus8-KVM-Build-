@@ -1,3 +1,4 @@
+# Triggered diagnostic build: KVM compiled, HYP/EL2 init bypassed.
 name: Build OnePlus 8 KVM HYP-bypass diagnostic boot
 
 on:
