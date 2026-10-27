@@ -1,0 +1,197 @@
+name: Fast package KVM HYP-bypass + stock module certificate diagnostic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/package-kvm-diag-stock-cert-fast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      SOURCE_ARTIFACT_ID: '12723510313'
+      ORIGINAL_IMAGE_SHA256: 'd7ffc23bd93f9dd981dfa359f915a04a551de925db6c3cd83e490f3416caded5'
+      STOCK_CERT_URL: 'https://raw.githubusercontent.com/daxiaamu/ReSukiSU-OnePlus-Legacy/d3ef96ab6c90aaf0645b148bee392dfdf4f9b036/compat/module-certificates/oneplus-8/coloros-0.pem'
+      STOCK_CERT_SHA256: '4394860b49e3d6ba66f95d58c2f86367a2d2db13479bb6b3e4351953ee3de715'
+      STOCK_CERT_DER_SHA256: '302cd52988233ae482dc3726210cb78f216bd92bf8dcc5585ace5d29a59daa51'
+      REFERENCE_URL: 'https://github.com/daxiaamu/ReSukiSU-OnePlus-Legacy/releases/download/v0.3.0/oneplus-8-coloros-IN2010_13.1.0.190-CN01-v0.3.0.zip'
+      REFERENCE_ZIP_SHA256: '76ff74b28a1eb5954d2c275a772642bd7e37891b765a6ade1d595e34f04be947'
+      REFERENCE_BOOT_SHA256: 'ce16155f0f1dfaa90da4c2508c8d219a8fdeeec35101669ea50d3979001a04d4'
+      STOCK_BOOT_SIZE: '100663296'
+      MAGISK_URL: 'https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk'
+      MAGISK_APK_SHA256: 'e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5'
+      OUTPUT_NAME: 'boot-IN2010-13.1.0.190-KVM-DIAG-HYP-BYPASS-STOCK-CERT.img'
+
+    steps:
+      - name: Download verified KVM Image and System.map
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          mkdir -p work/kernel work/reference work/base work/check out
+          curl -fL --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$SOURCE_ARTIFACT_ID/zip" \
+            -o work/kernel.zip
+          unzip -q work/kernel.zip -d work/kernel
+          echo "$ORIGINAL_IMAGE_SHA256  work/kernel/Image" | sha256sum -c -
+          test -s work/kernel/System.map
+
+      - name: Download and verify original ColorOS module certificate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 "$STOCK_CERT_URL" -o work/stock-trusted.pem
+          echo "$STOCK_CERT_SHA256  work/stock-trusted.pem" | sha256sum -c -
+          openssl x509 -in work/stock-trusted.pem -outform DER -out work/stock-trusted.der
+          echo "$STOCK_CERT_DER_SHA256  work/stock-trusted.der" | sha256sum -c -
+          openssl x509 -in work/stock-trusted.pem -noout -subject -issuer -fingerprint -sha256 | tee out/STOCK_CERT_INFO.txt
+
+      - name: Patch HYP entry and replace generated module certificate only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, struct
+
+          original = Path('work/kernel/Image').read_bytes()
+          data = bytearray(original)
+
+          # 1) 与上一版完全相同：旁路 kvm_arch_init，排除 HYP/EL2 运行时变量。
+          hyp_off = 0x3be88
+          expected = bytes.fromhex('ff8301d1fd7b01a9fd430091fa6702a9')
+          hyp_patch = bytes.fromhex('40028012c0035fd6')  # mov w0,#-19 ; ret
+          assert original[hyp_off:hyp_off+16] == expected, original[hyp_off:hyp_off+16].hex()
+          data[hyp_off:hyp_off+8] = hyp_patch
+
+          # 2) 从本次 KVM 的 System.map 精确定位内嵌模块证书区。
+          symbols = {}
+          for line in Path('work/kernel/System.map').read_text().splitlines():
+              p = line.split()
+              if len(p) >= 3:
+                  try:
+                      symbols[p[2]] = int(p[0], 16)
+                  except ValueError:
+                      pass
+          for name in ('_text', 'system_certificate_list', 'system_certificate_list_size'):
+              assert name in symbols, name
+          base = symbols['_text']
+          cert_off = symbols['system_certificate_list'] - base
+          size_off = symbols['system_certificate_list_size'] - base
+          capacity = size_off - cert_off
+          old_size = struct.unpack_from('<Q', original, size_off)[0]
+          assert capacity == 0x600, hex(capacity)
+          assert old_size == 1324, old_size
+
+          stock_der = Path('work/stock-trusted.der').read_bytes()
+          assert len(stock_der) == 1346, len(stock_der)
+          assert hashlib.sha256(stock_der).hexdigest() == '302cd52988233ae482dc3726210cb78f216bd92bf8dcc5585ace5d29a59daa51'
+          assert len(stock_der) <= capacity
+
+          # 用原厂 ColorOS 模块证书替换本次构建随机生成的证书。
+          # 不关闭 MODULE_SIG_FORCE，也不修改任何 KVM/调度/MM 代码。
+          data[cert_off:size_off] = b'\x00' * capacity
+          data[cert_off:cert_off+len(stock_der)] = stock_der
+          struct.pack_into('<Q', data, size_off, len(stock_der))
+
+          final = bytes(data)
+          assert len(final) == len(original)
+          assert final[hyp_off:hyp_off+8] == hyp_patch
+          assert final[cert_off:cert_off+len(stock_der)] == stock_der
+          assert struct.unpack_from('<Q', final, size_off)[0] == len(stock_der)
+
+          # 两个允许变化的区域之外必须逐字节完全相同。
+          allowed = [(hyp_off, hyp_off + 8), (cert_off, size_off + 8)]
+          def allowed_pos(i):
+              return any(a <= i < b for a, b in allowed)
+          diffs = [i for i,(a,b) in enumerate(zip(original, final)) if a != b]
+          assert diffs, 'no diff'
+          assert all(allowed_pos(i) for i in diffs), (min(diffs), max(diffs))
+
+          Path('work/Image-diag').write_bytes(final)
+          Path('out/PATCH_INFO.txt').write_text(
+              f'hyp_offset=0x{hyp_off:x}\n'
+              f'cert_offset=0x{cert_off:x}\n'
+              f'cert_capacity={capacity}\n'
+              f'old_cert_size={old_size}\n'
+              f'stock_cert_size={len(stock_der)}\n'
+              f'changed_bytes={len(diffs)}\n'
+              f'original_sha256={hashlib.sha256(original).hexdigest()}\n'
+              f'diagnostic_sha256={hashlib.sha256(final).hexdigest()}\n'
+          )
+          print(Path('out/PATCH_INFO.txt').read_text())
+          PY
+          sha256sum work/kernel/Image work/Image-diag | tee out/IMAGE_SHA256.txt
+          cat > out/README-DIAG.txt <<'EOF'
+          Diagnostic purpose: isolate ColorOS stock vendor-module certificate trust.
+          Base: exact verified KVM Image from successful run 40475096930.
+          KVM HYP/EL2 initialization is still bypassed exactly as in the previous diagnostic.
+          The only additional change is replacing the generated module certificate with the original IN2010 ColorOS certificate.
+          MODULE_SIG_FORCE behavior itself is not disabled.
+          Expected /dev/kvm: absent. Test bootability only.
+          EOF
+
+      - name: Prepare verified boot carrier and magiskboot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 "$REFERENCE_URL" -o work/reference.zip
+          echo "$REFERENCE_ZIP_SHA256  work/reference.zip" | sha256sum -c -
+          unzip -q work/reference.zip -d work/reference
+          mapfile -t boots < <(find work/reference -type f -name 'boot*.img' -print | sort)
+          test "${#boots[@]}" -eq 1
+          cp "${boots[0]}" work/reference-boot.img
+          echo "$REFERENCE_BOOT_SHA256  work/reference-boot.img" | sha256sum -c -
+          test "$(stat -c %s work/reference-boot.img)" -eq "$STOCK_BOOT_SIZE"
+
+          curl -fL --retry 3 "$MAGISK_URL" -o work/Magisk.apk
+          echo "$MAGISK_APK_SHA256  work/Magisk.apk" | sha256sum -c -
+          unzip -p work/Magisk.apk lib/x86_64/libmagiskboot.so > work/magiskboot
+          chmod +x work/magiskboot
+
+      - name: Repack and verify diagnostic boot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp work/reference-boot.img work/base/base.img
+          cp work/magiskboot work/base/magiskboot
+          pushd work/base
+          ./magiskboot unpack base.img > ../../out/base-unpack.log
+          test -s kernel
+          sha256sum dtb ramdisk.cpio > ../base-nonkernel.sha256
+          cp ../Image-diag kernel
+          cmp kernel ../Image-diag
+          ./magiskboot repack base.img candidate.img > ../../out/repack.log
+          popd
+
+          cp work/base/candidate.img "out/$OUTPUT_NAME"
+          truncate -s "$STOCK_BOOT_SIZE" "out/$OUTPUT_NAME"
+
+          cp "out/$OUTPUT_NAME" work/check/final.img
+          cp work/magiskboot work/check/magiskboot
+          pushd work/check
+          ./magiskboot unpack final.img > ../../out/final-unpack.log
+          cmp kernel ../Image-diag
+          sha256sum -c ../base-nonkernel.sha256
+          popd
+          test "$(stat -c %s "out/$OUTPUT_NAME")" -eq "$STOCK_BOOT_SIZE"
+          sha256sum "out/$OUTPUT_NAME" | tee out/BOOT_SHA256.txt
+
+      - name: Upload diagnostic boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus8-IN2010-KVM-DIAG-HYP-BYPASS-STOCK-CERT-FAST
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
