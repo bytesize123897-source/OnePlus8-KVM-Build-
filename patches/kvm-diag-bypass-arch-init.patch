@@ -1,0 +1,13 @@
+diff --git a/virt/kvm/arm/arm.c b/virt/kvm/arm/arm.c
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@ -1550,6 +1550,10 @@ int kvm_arch_init(void *opaque)
+ 	int ret, cpu;
+ 	bool in_hyp_mode;
+ 
++	pr_err("KVM-DIAG: bypassing kvm_arch_init before HYP/EL2 initialization\n");
++	return -ENODEV;
++
+ 	if (!is_hyp_mode_available()) {
+ 		kvm_info("HYP mode not available\n");
+ 		return -ENODEV;
