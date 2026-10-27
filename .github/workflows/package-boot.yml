@@ -119,7 +119,7 @@ jobs:
             sha256sum "$f" >> ../../base-nonkernel.sha256
           done < ../../base-nonkernel-files.txt
 
-          cp ../../../kernel/Image kernel
+          cp ../../kernel/Image kernel
           echo "$KVM_IMAGE_SHA256  kernel" | sha256sum -c -
 
           ./magiskboot repack base.img candidate.img 2>&1 | tee ../../repack.log
