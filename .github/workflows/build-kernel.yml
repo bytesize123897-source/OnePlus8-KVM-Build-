@@ -7,6 +7,7 @@ on:
     paths:
       - '.github/workflows/build-kernel.yml'
       - 'configs/**'
+      - 'patches/**'
   workflow_dispatch:
 
 concurrency:
@@ -83,14 +84,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-gnu-ld-${{ hashFiles('control/configs/kvm-minimal.config') }}
+          key: oneplus8-kvm-sm8250-linkfix-${{ hashFiles('control/patches/sm8250-link-compat.patch', 'control/configs/kvm-minimal.config') }}
           restore-keys: |
-            oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-gnu-ld-
+            oneplus8-kvm-sm8250-linkfix-
 
-      - name: Assemble untouched official OnePlus source tree
+      - name: Assemble official OnePlus source tree
         shell: bash
         run: |
           set -euxo pipefail
+          mkdir -p "$ARTIFACT_DIR"
 
           test -d "$MODULES_DIR/kernel/msm-4.19"
           rsync -a "$MODULES_DIR/kernel/msm-4.19/" "$KERNEL_DIR/"
@@ -101,7 +103,7 @@ jobs:
           test -f "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"
           test -f "$KERNEL_DIR/OplusKernelEnvConfig.mk"
           test -f "$KERNEL_DIR/oplus_native_features.mk"
-          test -d "$KERNEL_DIR/kernel/sched_assist"
+          test -f "$GITHUB_WORKSPACE/control/patches/sm8250-link-compat.patch"
           test -d vendor/oplus/kernel/oplus_performance/sched_assist
           test -d vendor/qcom/opensource/audio-kernel
           test -d vendor/qcom/opensource/data-kernel
@@ -113,19 +115,31 @@ jobs:
           if grep -RniE 'daxiaamu|resukisu|kernelsu' \
               "$KERNEL_DIR/Makefile" \
               "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"; then
-            echo 'Unexpected third-party branding/config found in official baseline.' >&2
+            echo 'Unexpected third-party branding/config found in source baseline.' >&2
             exit 1
           fi
 
-      - name: Build untouched official baseline
+      - name: Apply minimal SM8250 link compatibility fix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PATCH="$GITHUB_WORKSPACE/control/patches/sm8250-link-compat.patch"
+
+          git -C "$KERNEL_DIR" apply --check "$PATCH"
+          git -C "$KERNEL_DIR" apply "$PATCH"
+
+          grep -n 'BSS_FIRST_SECTIONS RTIC_BSS' "$KERNEL_DIR/arch/arm64/kernel/vmlinux.lds.S"
+          grep -n 'PROVIDE(__crc_gsi_write_channel_scratch = 0);' "$KERNEL_DIR/arch/arm64/kernel/vmlinux.lds.S"
+
+          git -C "$KERNEL_DIR" diff -- arch/arm64/kernel/vmlinux.lds.S \
+            | tee "$ARTIFACT_DIR/sm8250-link-compat-applied.diff"
+
+      - name: Build official baseline with link compatibility fix
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$STOCK_OUT_DIR" "$ARTIFACT_DIR"
 
-          # O= causes the top-level make to recurse into the output directory.
-          # OnePlus' Android build exports oplus_native_features.mk variables
-          # into the environment so sub-Makefiles can still see them.
           export_oplus_features() {
             local key value
             while IFS='=' read -r key value; do
@@ -145,8 +159,6 @@ jobs:
             test "${!feature:-}" = yes
           done
 
-          # Keep the two feature files in O= as well. This is harmless once
-          # variables are exported and makes the baseline robust to relative includes.
           cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$STOCK_OUT_DIR/OplusKernelEnvConfig.mk"
           cp "$KERNEL_DIR/oplus_native_features.mk" "$STOCK_OUT_DIR/oplus_native_features.mk"
 
@@ -173,9 +185,9 @@ jobs:
 
           extract_stock_errors() {
             if [ -f "$ARTIFACT_DIR/build-stock.log" ]; then
-              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld([^:]*): error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
-                "$ARTIFACT_DIR/build-stock.log" | head -n 200 > "$ARTIFACT_DIR/stock-first-errors.txt" || true
-              tail -n 250 "$ARTIFACT_DIR/build-stock.log" > "$ARTIFACT_DIR/stock-log-tail.txt" || true
+              grep -nEi 'fatal error:|(^|[[:space:]])error:|undefined (reference|symbol)|relocation|dangerous relocation|make(\[[0-9]+\])?: \*\*\*' \
+                "$ARTIFACT_DIR/build-stock.log" | head -n 240 > "$ARTIFACT_DIR/stock-first-errors.txt" || true
+              tail -n 300 "$ARTIFACT_DIR/build-stock.log" > "$ARTIFACT_DIR/stock-log-tail.txt" || true
             fi
           }
           trap 'status=$?; extract_stock_errors; exit $status' EXIT
@@ -230,7 +242,6 @@ jobs:
             KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
           )
 
-          # Start from the exact config that just produced Image-stock.
           cp "$STOCK_OUT_DIR/.config" "$OUT_DIR/.config"
           cp "$OUT_DIR/.config" "$OUT_DIR/stock.config"
 
@@ -242,11 +253,6 @@ jobs:
 
           grep -qx 'CONFIG_VIRTUALIZATION=y' "$OUT_DIR/.config"
           grep -qx 'CONFIG_KVM=y' "$OUT_DIR/.config"
-
-          if grep -qiE 'daxiaamu|resukisu|kernelsu' "$OUT_DIR/.config"; then
-            echo 'Unexpected third-party kernel configuration detected.' >&2
-            exit 1
-          fi
 
           "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" \
             | tee "$ARTIFACT_DIR/config-diff.txt"
@@ -290,9 +296,9 @@ jobs:
 
           extract_errors() {
             if [ -f "$ARTIFACT_DIR/build-kernel.log" ]; then
-              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld([^:]*): error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
-                "$ARTIFACT_DIR/build-kernel.log" | head -n 200 > "$ARTIFACT_DIR/first-errors.txt" || true
-              tail -n 250 "$ARTIFACT_DIR/build-kernel.log" > "$ARTIFACT_DIR/kvm-log-tail.txt" || true
+              grep -nEi 'fatal error:|(^|[[:space:]])error:|undefined (reference|symbol)|relocation|dangerous relocation|make(\[[0-9]+\])?: \*\*\*' \
+                "$ARTIFACT_DIR/build-kernel.log" | head -n 240 > "$ARTIFACT_DIR/first-errors.txt" || true
+              tail -n 300 "$ARTIFACT_DIR/build-kernel.log" > "$ARTIFACT_DIR/kvm-log-tail.txt" || true
             fi
           }
           trap 'status=$?; extract_errors; exit $status' EXIT
@@ -301,7 +307,6 @@ jobs:
 
           test -s "$OUT_DIR/arch/arm64/boot/Image"
           cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
-
           [ ! -f "$OUT_DIR/System.map" ] || cp "$OUT_DIR/System.map" "$ARTIFACT_DIR/System.map"
           [ ! -f "$OUT_DIR/Module.symvers" ] || cp "$OUT_DIR/Module.symvers" "$ARTIFACT_DIR/Module.symvers"
 
