@@ -65,29 +65,33 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             ccache rsync python3 git make \
-            clang-14 lld-14 llvm-14 \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+            clang-14 llvm-14 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
           mkdir -p "$CCACHE_DIR"
           ccache --set-config=max_size="$CCACHE_MAXSIZE"
           ccache --set-config=compression=true
           ccache --set-config=compiler_check=content
           ccache --zero-stats
+
           clang-14 --version | head -n 1
-          ld.lld-14 --version | head -n 1
+          aarch64-linux-gnu-ld --version | head -n 1
           aarch64-linux-gnu-gcc --version | head -n 1
 
       - name: Restore compiler cache
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-${{ hashFiles('control/configs/kvm-minimal.config') }}
+          key: oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-gnu-ld-${{ hashFiles('control/configs/kvm-minimal.config') }}
           restore-keys: |
-            oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-
+            oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-gnu-ld-
 
-      - name: Assemble official OnePlus source tree
+      - name: Assemble untouched official OnePlus source tree
         shell: bash
         run: |
           set -euxo pipefail
+
           test -d "$MODULES_DIR/kernel/msm-4.19"
           rsync -a "$MODULES_DIR/kernel/msm-4.19/" "$KERNEL_DIR/"
 
@@ -95,8 +99,9 @@ jobs:
           ln -s "$GITHUB_WORKSPACE/$MODULES_DIR/vendor" vendor
 
           test -f "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"
-          test -d vendor
-          test -f "$KERNEL_DIR/kernel/sched_assist/Kconfig"
+          test -f "$KERNEL_DIR/OplusKernelEnvConfig.mk"
+          test -f "$KERNEL_DIR/oplus_native_features.mk"
+          test -d "$KERNEL_DIR/kernel/sched_assist"
           test -d vendor/oplus/kernel/oplus_performance/sched_assist
           test -d vendor/qcom/opensource/audio-kernel
           test -d vendor/qcom/opensource/data-kernel
@@ -105,7 +110,9 @@ jobs:
           test "$(git -C "$KERNEL_DIR" rev-parse HEAD)" = "$OFFICIAL_KERNEL_SHA"
           test "$(git -C "$MODULES_DIR" rev-parse HEAD)" = "$OFFICIAL_MODULES_SHA"
 
-          if grep -RniE 'daxiaamu|resukisu|kernelsu' "$KERNEL_DIR/Makefile" "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"; then
+          if grep -RniE 'daxiaamu|resukisu|kernelsu' \
+              "$KERNEL_DIR/Makefile" \
+              "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"; then
             echo 'Unexpected third-party branding/config found in official baseline.' >&2
             exit 1
           fi
@@ -116,6 +123,30 @@ jobs:
           set -euxo pipefail
           mkdir -p "$STOCK_OUT_DIR" "$ARTIFACT_DIR"
 
+          # O= causes the top-level make to recurse into the output directory.
+          # OnePlus' Android build exports oplus_native_features.mk variables
+          # into the environment so sub-Makefiles can still see them.
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
+
+          for feature in \
+            OPLUS_FEATURE_UFSPLUS \
+            OPLUS_FEATURE_UFS_SHOW_LATENCY \
+            OPLUS_FEATURE_PADL_STATISTICS \
+            OPLUS_FEATURE_PROCESS_RECLAIM \
+            OPLUS_FEATURE_MEMLEAK_DETECT; do
+            printf '%s=%s\n' "$feature" "${!feature:-<unset>}" | tee -a "$ARTIFACT_DIR/oplus-feature-env.txt"
+            test "${!feature:-}" = yes
+          done
+
+          # Keep the two feature files in O= as well. This is harmless once
+          # variables are exported and makes the baseline robust to relative includes.
           cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$STOCK_OUT_DIR/OplusKernelEnvConfig.mk"
           cp "$KERNEL_DIR/oplus_native_features.mk" "$STOCK_OUT_DIR/oplus_native_features.mk"
 
@@ -127,32 +158,35 @@ jobs:
             CC="ccache clang-14"
             HOSTCC="ccache clang-14"
             HOSTCXX="ccache clang++-14"
-            LD=ld.lld-14
+            LD=aarch64-linux-gnu-ld
             AR=llvm-ar-14
             NM=llvm-nm-14
-            OBJCOPY=llvm-objcopy-14
+            OBJCOPY=aarch64-linux-gnu-objcopy
             OBJDUMP=llvm-objdump-14
             STRIP=llvm-strip-14
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             BRAND_SHOW_FLAG=oneplus
-            KCFLAGS="-Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
           )
 
           extract_stock_errors() {
             if [ -f "$ARTIFACT_DIR/build-stock.log" ]; then
-              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld\.lld: error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
-                "$ARTIFACT_DIR/build-stock.log" | head -n 160 > "$ARTIFACT_DIR/stock-first-errors.txt" || true
+              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld([^:]*): error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
+                "$ARTIFACT_DIR/build-stock.log" | head -n 200 > "$ARTIFACT_DIR/stock-first-errors.txt" || true
+              tail -n 250 "$ARTIFACT_DIR/build-stock.log" > "$ARTIFACT_DIR/stock-log-tail.txt" || true
             fi
           }
           trap 'status=$?; extract_stock_errors; exit $status' EXIT
 
           make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
           cp "$STOCK_OUT_DIR/.config" "$ARTIFACT_DIR/official-baseline.config"
+          sha256sum "$ARTIFACT_DIR/official-baseline.config" | tee "$ARTIFACT_DIR/official-baseline.config.sha256"
           make -s "${MAKE_ARGS[@]}" kernelrelease | tee "$ARTIFACT_DIR/stock-kernelrelease.txt"
 
           make "${MAKE_ARGS[@]}" -j"$(nproc)" Image 2>&1 | tee "$ARTIFACT_DIR/build-stock.log"
+
           test -s "$STOCK_OUT_DIR/arch/arm64/boot/Image"
           cp "$STOCK_OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image-stock"
           sha256sum "$ARTIFACT_DIR/Image-stock" | tee "$ARTIFACT_DIR/SHA256SUMS-stock.txt"
@@ -163,10 +197,15 @@ jobs:
           set -euxo pipefail
           mkdir -p "$OUT_DIR" "$ARTIFACT_DIR"
 
-          # OplusKernelEnvConfig.mk is included by a relative path. With O= it is
-          # resolved from the output tree, so mirror the two official feature files
-          # there. Without this, Kconfig enables vendor features while their Makefile
-          # objects (UFSPLUS/PADL/etc.) are silently omitted and vmlinux gets undefined symbols.
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
+
           cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$OUT_DIR/OplusKernelEnvConfig.mk"
           cp "$KERNEL_DIR/oplus_native_features.mk" "$OUT_DIR/oplus_native_features.mk"
 
@@ -178,19 +217,21 @@ jobs:
             CC="ccache clang-14"
             HOSTCC="ccache clang-14"
             HOSTCXX="ccache clang++-14"
-            LD=ld.lld-14
+            LD=aarch64-linux-gnu-ld
             AR=llvm-ar-14
             NM=llvm-nm-14
-            OBJCOPY=llvm-objcopy-14
+            OBJCOPY=aarch64-linux-gnu-objcopy
             OBJDUMP=llvm-objdump-14
             STRIP=llvm-strip-14
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             BRAND_SHOW_FLAG=oneplus
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
           )
 
-          make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
+          # Start from the exact config that just produced Image-stock.
+          cp "$STOCK_OUT_DIR/.config" "$OUT_DIR/.config"
           cp "$OUT_DIR/.config" "$OUT_DIR/stock.config"
 
           "$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" \
@@ -199,8 +240,6 @@ jobs:
 
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          grep -qx 'CONFIG_LOCALVERSION="-perf"' "$OUT_DIR/.config"
-          grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' "$OUT_DIR/.config"
           grep -qx 'CONFIG_VIRTUALIZATION=y' "$OUT_DIR/.config"
           grep -qx 'CONFIG_KVM=y' "$OUT_DIR/.config"
 
@@ -209,15 +248,24 @@ jobs:
             exit 1
           fi
 
-          "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" | tee "$ARTIFACT_DIR/config-diff.txt"
+          "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" \
+            | tee "$ARTIFACT_DIR/config-diff.txt"
           make -s "${MAKE_ARGS[@]}" kernelrelease | tee "$ARTIFACT_DIR/kernelrelease.txt"
-
           cp "$OUT_DIR/.config" "$ARTIFACT_DIR/final-kvm.config"
 
-      - name: Build kernel Image
+      - name: Build KVM kernel Image
         shell: bash
         run: |
           set -euxo pipefail
+
+          export_oplus_features() {
+            local key value
+            while IFS='=' read -r key value; do
+              [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+              export "$key=$value"
+            done < "$KERNEL_DIR/oplus_native_features.mk"
+          }
+          export_oplus_features
 
           MAKE_ARGS=(
             -C "$KERNEL_DIR"
@@ -227,28 +275,30 @@ jobs:
             CC="ccache clang-14"
             HOSTCC="ccache clang-14"
             HOSTCXX="ccache clang++-14"
-            LD=ld.lld-14
+            LD=aarch64-linux-gnu-ld
             AR=llvm-ar-14
             NM=llvm-nm-14
-            OBJCOPY=llvm-objcopy-14
+            OBJCOPY=aarch64-linux-gnu-objcopy
             OBJDUMP=llvm-objdump-14
             STRIP=llvm-strip-14
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             BRAND_SHOW_FLAG=oneplus
-            KCFLAGS="-Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+            KCFLAGS="-gdwarf-4 -Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
           )
 
           extract_errors() {
             if [ -f "$ARTIFACT_DIR/build-kernel.log" ]; then
-              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld\.lld: error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
-                "$ARTIFACT_DIR/build-kernel.log" | head -n 160 > "$ARTIFACT_DIR/first-errors.txt" || true
+              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld([^:]*): error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
+                "$ARTIFACT_DIR/build-kernel.log" | head -n 200 > "$ARTIFACT_DIR/first-errors.txt" || true
+              tail -n 250 "$ARTIFACT_DIR/build-kernel.log" > "$ARTIFACT_DIR/kvm-log-tail.txt" || true
             fi
           }
           trap 'status=$?; extract_errors; exit $status' EXIT
 
           make "${MAKE_ARGS[@]}" -j"$(nproc)" Image 2>&1 | tee "$ARTIFACT_DIR/build-kernel.log"
+
           test -s "$OUT_DIR/arch/arm64/boot/Image"
           cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
 
