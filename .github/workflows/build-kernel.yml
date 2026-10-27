@@ -110,6 +110,13 @@ jobs:
           set -euxo pipefail
           mkdir -p "$OUT_DIR" "$ARTIFACT_DIR"
 
+          # OplusKernelEnvConfig.mk is included by a relative path. With O= it is
+          # resolved from the output tree, so mirror the two official feature files
+          # there. Without this, Kconfig enables vendor features while their Makefile
+          # objects (UFSPLUS/PADL/etc.) are silently omitted and vmlinux gets undefined symbols.
+          cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$OUT_DIR/OplusKernelEnvConfig.mk"
+          cp "$KERNEL_DIR/oplus_native_features.mk" "$OUT_DIR/oplus_native_features.mk"
+
           MAKE_ARGS=(
             -C "$KERNEL_DIR"
             O="$GITHUB_WORKSPACE/$OUT_DIR"
