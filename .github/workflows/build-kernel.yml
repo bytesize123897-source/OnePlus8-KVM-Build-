@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     env:
@@ -28,21 +28,11 @@ jobs:
       MODULES_DIR: official-modules
       OUT_DIR: out
       ARTIFACT_DIR: artifact
-      ARCH: arm64
-      SUBARCH: arm64
-      CC: ccache clang-14
-      HOSTCC: ccache clang-14
-      HOSTCXX: ccache clang++-14
-      LD: ld.lld-14
-      AR: llvm-ar-14
-      NM: llvm-nm-14
-      OBJCOPY: llvm-objcopy-14
-      OBJDUMP: llvm-objdump-14
-      STRIP: llvm-strip-14
-      CLANG_TRIPLE: aarch64-linux-gnu-
-      CROSS_COMPILE: aarch64-linux-gnu-
-      CROSS_COMPILE_ARM32: arm-linux-gnueabi-
-      BRAND_SHOW_FLAG: oneplus
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: 'true'
+      CCACHE_MAXSIZE: 5G
+      CCACHE_COMPILERCHECK: content
 
     steps:
       - name: Checkout build controls
@@ -76,11 +66,22 @@ jobs:
             ccache rsync python3 git make \
             clang-14 lld-14 llvm-14 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-          ccache --zero-stats || true
-          ccache --max-size=5G || true
-          clang-14 --version
-          ld.lld-14 --version
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
+          ccache --set-config=compression=true
+          ccache --set-config=compiler_check=content
+          ccache --zero-stats
+          clang-14 --version | head -n 1
+          ld.lld-14 --version | head -n 1
           aarch64-linux-gnu-gcc --version | head -n 1
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-${{ hashFiles('control/configs/kvm-minimal.config') }}
+          restore-keys: |
+            oneplus8-kvm-1d2678a3548f-01fb3921e0f5-clang14-
 
       - name: Assemble official OnePlus source tree
         shell: bash
@@ -95,8 +96,8 @@ jobs:
           test -f "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"
           test -d vendor
 
-          echo "Kernel commit: $(git -C "$KERNEL_DIR" rev-parse HEAD)"
-          echo "Modules commit: $(git -C "$MODULES_DIR" rev-parse HEAD)"
+          test "$(git -C "$KERNEL_DIR" rev-parse HEAD)" = "$OFFICIAL_KERNEL_SHA"
+          test "$(git -C "$MODULES_DIR" rev-parse HEAD)" = "$OFFICIAL_MODULES_SHA"
 
           if grep -RniE 'daxiaamu|resukisu|kernelsu' "$KERNEL_DIR/Makefile" "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"; then
             echo 'Unexpected third-party branding/config found in official baseline.' >&2
@@ -109,11 +110,34 @@ jobs:
           set -euxo pipefail
           mkdir -p "$OUT_DIR" "$ARTIFACT_DIR"
 
-          make -C "$KERNEL_DIR" O="$GITHUB_WORKSPACE/$OUT_DIR" vendor/kona-perf_defconfig
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR"
+            O="$GITHUB_WORKSPACE/$OUT_DIR"
+            ARCH=arm64
+            SUBARCH=arm64
+            CC="ccache clang-14"
+            HOSTCC="ccache clang-14"
+            HOSTCXX="ccache clang++-14"
+            LD=ld.lld-14
+            AR=llvm-ar-14
+            NM=llvm-nm-14
+            OBJCOPY=llvm-objcopy-14
+            OBJDUMP=llvm-objdump-14
+            STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            BRAND_SHOW_FLAG=oneplus
+          )
+
+          make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
           cp "$OUT_DIR/.config" "$OUT_DIR/stock.config"
 
-          cat "$GITHUB_WORKSPACE/control/configs/kvm-minimal.config" >> "$OUT_DIR/.config"
-          make -C "$KERNEL_DIR" O="$GITHUB_WORKSPACE/$OUT_DIR" olddefconfig
+          "$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" \
+            -e VIRTUALIZATION \
+            -e KVM
+
+          make "${MAKE_ARGS[@]}" olddefconfig
 
           grep -qx 'CONFIG_LOCALVERSION="-perf"' "$OUT_DIR/.config"
           grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' "$OUT_DIR/.config"
@@ -126,7 +150,7 @@ jobs:
           fi
 
           "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" | tee "$ARTIFACT_DIR/config-diff.txt"
-          make -s -C "$KERNEL_DIR" O="$GITHUB_WORKSPACE/$OUT_DIR" kernelrelease | tee "$ARTIFACT_DIR/kernelrelease.txt"
+          make -s "${MAKE_ARGS[@]}" kernelrelease | tee "$ARTIFACT_DIR/kernelrelease.txt"
 
           cp "$OUT_DIR/stock.config" "$ARTIFACT_DIR/official-baseline.config"
           cp "$OUT_DIR/.config" "$ARTIFACT_DIR/final-kvm.config"
@@ -135,12 +159,34 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          make -C "$KERNEL_DIR" O="$GITHUB_WORKSPACE/$OUT_DIR" -j"$(nproc)" Image
+
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR"
+            O="$GITHUB_WORKSPACE/$OUT_DIR"
+            ARCH=arm64
+            SUBARCH=arm64
+            CC="ccache clang-14"
+            HOSTCC="ccache clang-14"
+            HOSTCXX="ccache clang++-14"
+            LD=ld.lld-14
+            AR=llvm-ar-14
+            NM=llvm-nm-14
+            OBJCOPY=llvm-objcopy-14
+            OBJDUMP=llvm-objdump-14
+            STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            BRAND_SHOW_FLAG=oneplus
+          )
+
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image
           test -s "$OUT_DIR/arch/arm64/boot/Image"
           cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
-          if [ -f "$OUT_DIR/System.map" ]; then
-            cp "$OUT_DIR/System.map" "$ARTIFACT_DIR/System.map"
-          fi
+
+          [ ! -f "$OUT_DIR/System.map" ] || cp "$OUT_DIR/System.map" "$ARTIFACT_DIR/System.map"
+          [ ! -f "$OUT_DIR/Module.symvers" ] || cp "$OUT_DIR/Module.symvers" "$ARTIFACT_DIR/Module.symvers"
+
           file "$ARTIFACT_DIR/Image"
           sha256sum "$ARTIFACT_DIR/Image" | tee "$ARTIFACT_DIR/SHA256SUMS.txt"
           ccache --show-stats || true
