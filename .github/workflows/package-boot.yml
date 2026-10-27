@@ -1,4 +1,5 @@
 name: Package OnePlus 8 KVM boot.img
+# package-only: reuse verified run 40475096930; no kernel recompilation
 
 on:
   push:
@@ -110,7 +111,6 @@ jobs:
           ./magiskboot unpack base.img 2>&1 | tee ../../base-unpack.log
           test -s kernel
 
-          # Snapshot every unpacked non-kernel payload before replacing anything.
           find . -maxdepth 1 -type f -printf '%f\n' \
             | grep -vE '^(base\.img|magiskboot|kernel)$' \
             | sort > ../../base-nonkernel-files.txt
