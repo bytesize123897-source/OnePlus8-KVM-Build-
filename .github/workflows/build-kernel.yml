@@ -26,6 +26,7 @@ jobs:
       OFFICIAL_MODULES_SHA: 01fb3921e0f57c338c95f9bcbe1a9938821c7e6d
       KERNEL_DIR: kernel/msm-4.19
       MODULES_DIR: official-modules
+      STOCK_OUT_DIR: out-stock
       OUT_DIR: out
       ARTIFACT_DIR: artifact
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -95,6 +96,11 @@ jobs:
 
           test -f "$KERNEL_DIR/arch/arm64/configs/vendor/kona-perf_defconfig"
           test -d vendor
+          test -f "$KERNEL_DIR/kernel/sched_assist/Kconfig"
+          test -d vendor/oplus/kernel/oplus_performance/sched_assist
+          test -d vendor/qcom/opensource/audio-kernel
+          test -d vendor/qcom/opensource/data-kernel
+          test -d vendor/qcom/opensource/wlan
 
           test "$(git -C "$KERNEL_DIR" rev-parse HEAD)" = "$OFFICIAL_KERNEL_SHA"
           test "$(git -C "$MODULES_DIR" rev-parse HEAD)" = "$OFFICIAL_MODULES_SHA"
@@ -103,6 +109,53 @@ jobs:
             echo 'Unexpected third-party branding/config found in official baseline.' >&2
             exit 1
           fi
+
+      - name: Build untouched official baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$STOCK_OUT_DIR" "$ARTIFACT_DIR"
+
+          cp "$KERNEL_DIR/OplusKernelEnvConfig.mk" "$STOCK_OUT_DIR/OplusKernelEnvConfig.mk"
+          cp "$KERNEL_DIR/oplus_native_features.mk" "$STOCK_OUT_DIR/oplus_native_features.mk"
+
+          MAKE_ARGS=(
+            -C "$KERNEL_DIR"
+            O="$GITHUB_WORKSPACE/$STOCK_OUT_DIR"
+            ARCH=arm64
+            SUBARCH=arm64
+            CC="ccache clang-14"
+            HOSTCC="ccache clang-14"
+            HOSTCXX="ccache clang++-14"
+            LD=ld.lld-14
+            AR=llvm-ar-14
+            NM=llvm-nm-14
+            OBJCOPY=llvm-objcopy-14
+            OBJDUMP=llvm-objdump-14
+            STRIP=llvm-strip-14
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            BRAND_SHOW_FLAG=oneplus
+            KCFLAGS="-Wno-error=strict-prototypes -Wno-error=unused-but-set-variable"
+          )
+
+          extract_stock_errors() {
+            if [ -f "$ARTIFACT_DIR/build-stock.log" ]; then
+              grep -nEi 'fatal error:|(^|[[:space:]])error:|ld\.lld: error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
+                "$ARTIFACT_DIR/build-stock.log" | head -n 160 > "$ARTIFACT_DIR/stock-first-errors.txt" || true
+            fi
+          }
+          trap 'status=$?; extract_stock_errors; exit $status' EXIT
+
+          make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
+          cp "$STOCK_OUT_DIR/.config" "$ARTIFACT_DIR/official-baseline.config"
+          make -s "${MAKE_ARGS[@]}" kernelrelease | tee "$ARTIFACT_DIR/stock-kernelrelease.txt"
+
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image 2>&1 | tee "$ARTIFACT_DIR/build-stock.log"
+          test -s "$STOCK_OUT_DIR/arch/arm64/boot/Image"
+          cp "$STOCK_OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image-stock"
+          sha256sum "$ARTIFACT_DIR/Image-stock" | tee "$ARTIFACT_DIR/SHA256SUMS-stock.txt"
 
       - name: Configure official baseline plus minimal KVM
         shell: bash
@@ -159,7 +212,6 @@ jobs:
           "$KERNEL_DIR/scripts/diffconfig" "$OUT_DIR/stock.config" "$OUT_DIR/.config" | tee "$ARTIFACT_DIR/config-diff.txt"
           make -s "${MAKE_ARGS[@]}" kernelrelease | tee "$ARTIFACT_DIR/kernelrelease.txt"
 
-          cp "$OUT_DIR/stock.config" "$ARTIFACT_DIR/official-baseline.config"
           cp "$OUT_DIR/.config" "$ARTIFACT_DIR/final-kvm.config"
 
       - name: Build kernel Image
@@ -191,7 +243,7 @@ jobs:
           extract_errors() {
             if [ -f "$ARTIFACT_DIR/build-kernel.log" ]; then
               grep -nEi 'fatal error:|(^|[[:space:]])error:|ld\.lld: error:|undefined (reference|symbol)|make(\[[0-9]+\])?: \*\*\*' \
-                "$ARTIFACT_DIR/build-kernel.log" | head -n 120 > "$ARTIFACT_DIR/first-errors.txt" || true
+                "$ARTIFACT_DIR/build-kernel.log" | head -n 160 > "$ARTIFACT_DIR/first-errors.txt" || true
             fi
           }
           trap 'status=$?; extract_errors; exit $status' EXIT
