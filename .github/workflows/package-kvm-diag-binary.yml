@@ -1,0 +1,154 @@
+name: Package KVM HYP-bypass binary diagnostic boot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/package-kvm-diag-binary.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      SOURCE_ARTIFACT_ID: '12723510313'
+      ORIGINAL_IMAGE_SHA256: 'd7ffc23bd93f9dd981dfa359f915a04a551de925db6c3cd83e490f3416caded5'
+      PATCH_OFFSET: '0x3be88'
+      EXPECTED_PROLOGUE16: 'ff8301d1fd7b01a9fd430091fa6702a9'
+      PATCH8: '40028012c0035fd6'
+      REFERENCE_URL: 'https://github.com/daxiaamu/ReSukiSU-OnePlus-Legacy/releases/download/v0.3.0/oneplus-8-coloros-IN2010_13.1.0.190-CN01-v0.3.0.zip'
+      REFERENCE_ZIP_SHA256: '76ff74b28a1eb5954d2c275a772642bd7e37891b765a6ade1d595e34f04be947'
+      REFERENCE_BOOT_SHA256: 'ce16155f0f1dfaa90da4c2508c8d219a8fdeeec35101669ea50d3979001a04d4'
+      STOCK_BOOT_SIZE: '100663296'
+      MAGISK_URL: 'https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk'
+      MAGISK_APK_SHA256: 'e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5'
+      MAGISKBOOT_MEMBER: 'lib/x86_64/libmagiskboot.so'
+      OUTPUT_NAME: 'boot-IN2010-13.1.0.190-KVM-DIAG-BYPASS-HYP-BINARY.img'
+
+    steps:
+      - name: Checkout controls
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl unzip file coreutils diffutils python3
+
+      - name: Download verified successful KVM Image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          mkdir -p work/kernel work/reference work/base work/check out
+          curl -fL --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$SOURCE_ARTIFACT_ID/zip" \
+            -o work/kernel.zip
+          unzip -q work/kernel.zip -d work/kernel
+          test -s work/kernel/Image
+          echo "$ORIGINAL_IMAGE_SHA256  work/kernel/Image" | sha256sum -c -
+
+      - name: Patch only kvm_arch_init entry (8 bytes)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp work/kernel/Image work/Image-diag
+          python3 - <<'PY'
+          import os, hashlib
+          from pathlib import Path
+          p = Path('work/Image-diag')
+          data = bytearray(p.read_bytes())
+          off = int(os.environ['PATCH_OFFSET'], 0)
+          expected = bytes.fromhex(os.environ['EXPECTED_PROLOGUE16'])
+          patch = bytes.fromhex(os.environ['PATCH8'])
+          before = bytes(data[off:off+16])
+          if before != expected:
+              raise SystemExit(f'prologue mismatch at {off:#x}: {before.hex()} != {expected.hex()}')
+          data[off:off+len(patch)] = patch
+          p.write_bytes(data)
+          after = bytes(data[off:off+16])
+          print(f'offset={off:#x}')
+          print(f'before16={before.hex()}')
+          print(f'after16 ={after.hex()}')
+          print(f'sha256={hashlib.sha256(data).hexdigest()}')
+          PY
+          test "$(stat -c %s work/Image-diag)" -eq "$(stat -c %s work/kernel/Image)"
+          cmp -n $((0x3be88)) work/kernel/Image work/Image-diag
+          dd if=work/kernel/Image bs=1 skip=$((0x3be88 + 8)) of=work/orig-tail.bin status=none
+          dd if=work/Image-diag bs=1 skip=$((0x3be88 + 8)) of=work/diag-tail.bin status=none
+          cmp work/orig-tail.bin work/diag-tail.bin
+          sha256sum work/kernel/Image work/Image-diag | tee out/IMAGE_SHA256.txt
+          printf '%s\n' \
+            'Binary diagnostic: the verified successful KVM Image is unchanged except 8 bytes at kvm_arch_init().' \
+            'Patch instructions: mov w0,#-19 (-ENODEV); ret.' \
+            'Purpose: bypass all runtime KVM HYP/EL2 initialization while preserving the exact KVM-built image layout/config.' \
+            'Expected /dev/kvm: absent.' > out/README-DIAG.txt
+
+      - name: Download and verify IN2010 carrier and magiskboot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 "$REFERENCE_URL" -o work/reference.zip
+          echo "$REFERENCE_ZIP_SHA256  work/reference.zip" | sha256sum -c -
+          unzip -q work/reference.zip -d work/reference
+          mapfile -t boots < <(find work/reference -type f -name 'boot*.img' -print | sort)
+          test "${#boots[@]}" -eq 1
+          cp "${boots[0]}" work/reference-boot.img
+          echo "$REFERENCE_BOOT_SHA256  work/reference-boot.img" | sha256sum -c -
+          test "$(stat -c %s work/reference-boot.img)" -eq "$STOCK_BOOT_SIZE"
+          curl -fL --retry 3 "$MAGISK_URL" -o work/Magisk.apk
+          echo "$MAGISK_APK_SHA256  work/Magisk.apk" | sha256sum -c -
+          unzip -p work/Magisk.apk "$MAGISKBOOT_MEMBER" > work/magiskboot
+          chmod +x work/magiskboot
+
+      - name: Repack and structurally verify diagnostic boot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp work/reference-boot.img work/base/base.img
+          cp work/magiskboot work/base/magiskboot
+          pushd work/base
+          ./magiskboot unpack base.img | tee ../../out/base-unpack.log
+          test -s kernel
+          find . -maxdepth 1 -type f -printf '%f\n' | grep -vE '^(base\.img|magiskboot|kernel)$' | sort > ../base-files.txt
+          : > ../base-nonkernel.sha256
+          while IFS= read -r f; do sha256sum "$f" >> ../base-nonkernel.sha256; done < ../base-files.txt
+          cp ../Image-diag kernel
+          cmp kernel ../Image-diag
+          ./magiskboot repack base.img candidate.img | tee ../../out/repack.log
+          popd
+
+          cp work/base/candidate.img "out/$OUTPUT_NAME"
+          truncate -s "$STOCK_BOOT_SIZE" "out/$OUTPUT_NAME"
+          test "$(stat -c %s "out/$OUTPUT_NAME")" -eq "$STOCK_BOOT_SIZE"
+
+          cp "out/$OUTPUT_NAME" work/check/final.img
+          cp work/magiskboot work/check/magiskboot
+          pushd work/check
+          ./magiskboot unpack final.img | tee ../../out/final-unpack.log
+          cmp kernel ../Image-diag
+          find . -maxdepth 1 -type f -printf '%f\n' | grep -vE '^(final\.img|magiskboot|kernel)$' | sort > ../final-files.txt
+          popd
+          diff -u work/base-files.txt work/final-files.txt
+          pushd work/check
+          sha256sum -c ../base-nonkernel.sha256
+          popd
+          sha256sum "out/$OUTPUT_NAME" | tee out/BOOT_SHA256.txt
+
+      - name: Upload diagnostic boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus8-IN2010-KVM-DIAG-BYPASS-HYP-BINARY
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
